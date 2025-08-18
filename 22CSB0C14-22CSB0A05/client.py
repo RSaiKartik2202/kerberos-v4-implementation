@@ -4,34 +4,42 @@ import socket
 import json
 import time
 from common import encrypt_obj, decrypt_obj, send_json, recv_json, now_minutes, log
+from diskcache import Cache
 
+cache = Cache("./kerberos_cache")
 
 def as_req(as_host, as_port, client_name, client_pass, initial_epoch):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((as_host, as_port))
-    nonce = int(time.time()) & 0xffff
-    send_json(s, {"type": "AS_REQ", "client": client_name, "nonce": nonce})
-    rep = recv_json(s)
-    s.close()
-    if rep.get("type") != "AS_REP":
-        raise RuntimeError(f"AS error: {rep}")
-    data = decrypt_obj(rep["data"], client_pass)
+    data = cache.get("tgt",default=None)
+    if data == None:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((as_host, as_port))
+        nonce = int(time.time()) & 0xffff
+        send_json(s, {"type": "AS_REQ", "client": client_name, "nonce": nonce})
+        rep = recv_json(s)
+        s.close()
+        if rep.get("type") != "AS_REP":
+            raise RuntimeError(f"AS error: {rep}")
+        data = decrypt_obj(rep["data"], client_pass)
+        cache.set("tgt", data)
     # returns k_c_tgs, tgt
     return data["k_c_tgs"], data["tgt"], data["lifetime"]
 
 
 def tgs_req(tgs_host, tgs_port, service, tgt, k_c_tgs, client_name, initial_epoch):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((tgs_host, tgs_port))
-    ts = now_minutes(initial_epoch)
-    authenticator = encrypt_obj({"client": client_name, "ts": ts}, k_c_tgs)
-    send_json(s, {"type": "TGS_REQ", "service": service,
-              "tgt": tgt, "authenticator": authenticator})
-    rep = recv_json(s)
-    s.close()
-    if rep.get("type") != "TGS_REP":
-        raise RuntimeError(f"TGS error: {rep}")
-    data = decrypt_obj(rep["data"], k_c_tgs)
+    data = cache.get("sgt",default=None)
+    if data == None:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((tgs_host, tgs_port))
+        ts = now_minutes(initial_epoch)
+        authenticator = encrypt_obj({"client": client_name, "ts": ts}, k_c_tgs)
+        send_json(s, {"type": "TGS_REQ", "service": service,
+                "tgt": tgt, "authenticator": authenticator})
+        rep = recv_json(s)
+        s.close()
+        if rep.get("type") != "TGS_REP":
+            raise RuntimeError(f"TGS error: {rep}")
+        data = decrypt_obj(rep["data"], k_c_tgs)
+        cache.set("sgt", data)
     return data["k_c_s"], data["ticket_s"], data["lifetime"]
 
 
