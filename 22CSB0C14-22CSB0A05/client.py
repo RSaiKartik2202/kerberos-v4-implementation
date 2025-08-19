@@ -23,7 +23,6 @@ def as_req(as_host, as_port, client_name, client_pass, idtgs, adc, initial_epoch
     cached = cache.get("tgt", default=None)
     nowm = now_minutes(initial_epoch)
 
-    print(cached)
     if cached and (nowm <= cached["TS2"] + cached["Lifetime2"]):
         return cached["Kc_tgs"], cached["Tickettgs"], cached["Lifetime2"], cached["TS2"]
 
@@ -64,13 +63,12 @@ def tgs_req(tgs_host, tgs_port, service, tickettgs, Kc_tgs, client_name, adc, in
     rep = recv_json(s)
     s.close()
 
-    print(rep)
     if rep.get("type") != "TGS_REP":
         raise RuntimeError(f"TGS error: {rep}")
 
     plain = decrypt_obj(rep["data"], Kc_tgs)
     cache.set(key, plain)
-    return plain["Kc_v"], plain["Ticketv"], plain["Lifetime4"], plain["TS4"]
+    return plain["Kc_v"], plain["Ticketv"], plain["Lifetime4"] ,plain["TS4"]
 
 # --- Application request ---
 def app_req(server_host, server_port, Ticketv, Kc_v, client_name, adc, message, initial_epoch):
@@ -122,10 +120,10 @@ def main():
 
     # 2) TGS exchange
     server_host = "127.0.0.1"  # for testing, can be configured
-    k_c_s, ticket_s, st_life, ts4 = tgs_req(
+    k_c_s, ticket_s, lifetime4 ,ts4 = tgs_req(
         args.tgs_host, args.tgs_port, args.service, tgt, k_c_tgs, CLIENT_NAME, CLIENT_AD, args.initial_wall_clock
     )
-    log(f"[Client:{CLIENT_NAME}] Got ServiceTicket for {args.service} (life={st_life}m)")
+    log(f"[Client:{CLIENT_NAME}] Got ServiceTicket for {args.service}, lifetime: {lifetime4}")
 
     # 3) App request
     # Replace with actual service port mapping or config

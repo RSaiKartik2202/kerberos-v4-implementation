@@ -89,8 +89,6 @@ def handle_tgs_conn(conn, addr, initial_epoch: int):
         Tickettgs = req["Tickettgs"]
         Authc = req["Authenticatorc"]
 
-        tgt_data = decrypt_obj(Tickettgs, None)
-
         tgs = get_tgs()
         tgt_data = decrypt_obj(Tickettgs, tgs["ktgs"])
         Kc_tgs, IDc, ADc_tgt, _, TS2, Lifetime2 = (
@@ -136,6 +134,7 @@ def handle_tgs_conn(conn, addr, initial_epoch: int):
             "Kc_v": Kc_v,
             "IDv": IDv,
             "TS4": TS4,
+            "Lifetime4":Lifetime4,
             "Ticketv": Ticketv
         }, Kc_tgs)
 
