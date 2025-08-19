@@ -1,189 +1,178 @@
-
 import argparse
-import json
 import socket
 import threading
-import time
-from typing import Dict, Any
-from common import encrypt_obj, decrypt_obj, send_json, recv_json, now_minutes, log
+from utils.crypto import encrypt_obj, decrypt_obj, send_json, recv_json, now_minutes, log
+from utils.kerberos_db import get_client, get_server, get_tgs, get_tgs_by_id
 
-# In-memory DB loaded from JSON file
-
-
-class AuthDB:
-    def __init__(self, path: str):
-        with open(path, 'r') as f:
-            db = json.load(f)
-        self.clients = db["clients"]           # { name: password }
-        # { name: {"port": int, "password": str} }
-        self.servers = db["servers"]
-        self.ktgs = db["ktgs"]                 # secret shared by AS and TGS
-        self.default_lifetime_tgt = db.get(
-            "default_lifetime_tgt", 10)  # minutes
-        self.default_lifetime_st = db.get(
-            "default_lifetime_st", 5)     # minutes
-
-# AS: handles TGT requests on port 6000
-
-
-def run_as(db: AuthDB, host: str, port: int, initial_epoch: int):
+# --- AS: Handles TGT requests ---
+def run_as(host: str, port: int, initial_epoch: int):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
     srv.listen(5)
     log(f"[AS] Listening on {host}:{port}")
+    
     while True:
         conn, addr = srv.accept()
-        threading.Thread(target=handle_as_conn, args=(
-            db, conn, addr, initial_epoch), daemon=True).start()
+        threading.Thread(target=handle_as_conn, args=(conn, addr, initial_epoch), daemon=True).start()
 
 
-def handle_as_conn(db: AuthDB, conn: socket.socket, addr, initial_epoch: int):
+def handle_as_conn(conn, addr, initial_epoch: int):
     try:
         req = recv_json(conn)
-        # Expect: {"type": "AS_REQ", "client": C, "nonce": n}
         if req.get("type") != "AS_REQ":
-            send_json(conn, {"type": "ERR", "reason": "bad type"})
-            return
-        c = req["client"]
-        nonce = req.get("nonce", 0)
-        if c not in db.clients:
-            send_json(conn, {"type": "ERR", "reason": "unknown client"})
-            return
+            return send_json(conn, {"type": "ERR", "reason": "bad type"})
+
+        IDc, IDtgs, TS1 = req["IDc"], req["IDtgs"], req["TS1"]
+        client = get_client(IDc)
+        tgs = get_tgs_by_id(IDtgs)
+
+        if not tgs:
+            return send_json(conn, {"type": "ERR", "reason": "unknown TGS"})
+
+        if not client:
+            return send_json(conn, {"type": "ERR", "reason": "unknown client"})
+
         nowm = now_minutes(initial_epoch)
-        # Create session key for C<->TGS
-        k_c_tgs = f"KC_TGS_{c}_{nowm}_{nonce}"
-        # TGT: encrypted with K_tgs
-        tgt = encrypt_obj({
-            "client": c,
-            "k_c_tgs": k_c_tgs,
-            "ts": nowm,
-            "lifetime": db.default_lifetime_tgt
-        }, db.ktgs)
-        # Reply to client, encrypted with K_c (client password)
+        Kc_tgs = f"Kc_tgs::{IDc}::{nowm}"
+        Lifetime2 = tgs["default_lifetime_tgt"]
+        TS2 = nowm
+
+        ADc = addr[0]  # client IP
+        # Build TGT (encrypted with Ktgs)
+        Tickettgs = encrypt_obj({
+            "Kc_tgs": Kc_tgs,
+            "IDc": IDc,
+            "ADc": ADc,
+            "IDtgs": IDtgs,
+            "TS2": TS2,
+            "Lifetime2": Lifetime2
+        }, tgs["ktgs"])
+
+        # Encrypt response for client using client's password (long-term key)
         enc_for_c = encrypt_obj({
-            "k_c_tgs": k_c_tgs,
-            "tgt": tgt,
-            "ts": nowm,
-            "lifetime": db.default_lifetime_tgt,
-            "nonce": nonce
-        }, db.clients[c])
+            "Kc_tgs": Kc_tgs,
+            "IDtgs": IDtgs,
+            "TS2": TS2,
+            "Lifetime2": Lifetime2,
+            "Tickettgs": Tickettgs
+        }, client["password"])
+
         send_json(conn, {"type": "AS_REP", "data": enc_for_c})
-        log(f"[AS] Issued TGT to {c} at t={nowm} (lifetime={db.default_lifetime_tgt}m)")
+        log(f"[AS] TGT→{IDc} TS2={TS2} life={Lifetime2}m")
     except Exception as e:
-        try:
-            send_json(conn, {"type": "ERR", "reason": str(e)})
-        except:
-            pass
+        send_json(conn, {"type": "ERR", "reason": str(e)})
     finally:
         conn.close()
 
-# TGS: handles service ticket requests on port 6001
 
-
-def run_tgs(db: AuthDB, host: str, port: int, initial_epoch: int):
+# --- TGS: Handles service ticket requests ---
+def run_tgs(host: str, port: int, initial_epoch: int):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
     srv.listen(5)
     log(f"[TGS] Listening on {host}:{port}")
+    
     while True:
         conn, addr = srv.accept()
-        threading.Thread(target=handle_tgs_conn, args=(
-            db, conn, addr, initial_epoch), daemon=True).start()
+        threading.Thread(target=handle_tgs_conn, args=(conn, addr, initial_epoch), daemon=True).start()
 
 
-def handle_tgs_conn(db: AuthDB, conn: socket.socket, addr, initial_epoch: int):
+def handle_tgs_conn(conn, addr, initial_epoch: int):
     try:
         req = recv_json(conn)
-        # Expect: {"type": "TGS_REQ", "service": S, "tgt": TGT, "authenticator": ENC_{k_c_tgs}({client, ts})}
         if req.get("type") != "TGS_REQ":
-            send_json(conn, {"type": "ERR", "reason": "bad type"})
-            return
-        service = req["service"]
-        tgt = req["tgt"]
-        auth = req["authenticator"]
-        # Decrypt TGT with K_tgs
-        tgt_plain = decrypt_obj(tgt, db.ktgs)
-        c = tgt_plain["client"]
-        k_c_tgs = tgt_plain["k_c_tgs"]
-        ts_tgt = tgt_plain["ts"]
-        lifetime_tgt = tgt_plain["lifetime"]
+            return send_json(conn, {"type": "ERR", "reason": "bad type"})
+
+        IDv = req["IDv"]
+        Tickettgs = req["Tickettgs"]
+        Authc = req["Authenticatorc"]
+
+        tgt_data = decrypt_obj(Tickettgs, None)
+
+        tgs = get_tgs()
+        tgt_data = decrypt_obj(Tickettgs, tgs["ktgs"])
+        Kc_tgs, IDc, ADc_tgt, _, TS2, Lifetime2 = (
+            tgt_data["Kc_tgs"],
+            tgt_data["IDc"],
+            tgt_data["ADc"],
+            tgt_data["IDtgs"],
+            tgt_data["TS2"],
+            tgt_data["Lifetime2"],
+        )
+
         nowm = now_minutes(initial_epoch)
-        # Validate TGT lifetime
-        if not (nowm >= ts_tgt and nowm <= ts_tgt + lifetime_tgt):
-            send_json(conn, {"type": "ERR", "reason": "TGT expired"})
-            return
-        # Decrypt authenticator
-        auth_plain = decrypt_obj(auth, k_c_tgs)
-        if auth_plain.get("client") != c:
-            send_json(
-                conn, {"type": "ERR", "reason": "authenticator mismatch"})
-            return
-        # Check replay (freshness): authenticator ts must be close (within TGT lifetime)
-        if not (nowm >= auth_plain.get("ts", -10) and nowm <= ts_tgt + lifetime_tgt):
-            send_json(conn, {"type": "ERR", "reason": "stale authenticator"})
-            return
-        # Service exists?
-        if service not in db.servers:
-            send_json(conn, {"type": "ERR", "reason": "unknown service"})
-            return
-        ks = db.servers[service]["password"]
-        # New session key C<->S
-        k_c_s = f"KC_S_{c}_{service}_{nowm}"
-        ticket_s = encrypt_obj({
-            "client": c,
-            "k_c_s": k_c_s,
-            "ts": nowm,
-            "lifetime": db.default_lifetime_st,
-            "service": service
-        }, ks)
-        # Enc for client with k_c_tgs
+        if not (TS2 <= nowm <= TS2 + Lifetime2):
+            return send_json(conn, {"type": "ERR", "reason": "TGT expired"})
+
+        auth_data = decrypt_obj(Authc, Kc_tgs)
+        if auth_data["IDc"] != IDc:
+            return send_json(conn, {"type": "ERR", "reason": "client mismatch"})
+        if auth_data["ADc"] != ADc_tgt:
+            return send_json(conn, {"type": "ERR", "reason": "addr mismatch"})
+        if auth_data["TS3"] > nowm or auth_data["TS3"] < TS2:
+            return send_json(conn, {"type": "ERR", "reason": "stale authenticator"})
+
+        service = get_server(IDv)
+        if not service:
+            return send_json(conn, {"type": "ERR", "reason": "unknown service"})
+        Kv = service["password"]
+
+        Kc_v = f"Kc_v::{IDc}::{IDv}::{nowm}"
+        Lifetime4 = tgs["default_lifetime_st"]
+        TS4 = nowm
+
+        Ticketv = encrypt_obj({
+            "Kc_v": Kc_v,
+            "IDc": IDc,
+            "ADc": ADc_tgt,
+            "IDv": IDv,
+            "TS4": TS4,
+            "Lifetime4": Lifetime4
+        }, Kv)
+
         enc_for_c = encrypt_obj({
-            "k_c_s": k_c_s,
-            "ticket_s": ticket_s,
-            "ts": nowm,
-            "lifetime": db.default_lifetime_st,
-            "service": service
-        }, k_c_tgs)
+            "Kc_v": Kc_v,
+            "IDv": IDv,
+            "TS4": TS4,
+            "Ticketv": Ticketv
+        }, Kc_tgs)
+
         send_json(conn, {"type": "TGS_REP", "data": enc_for_c})
-        log(f"[TGS] Issued ServiceTicket to {c} for {service} at t={nowm} (life={db.default_lifetime_st}m)")
+        log(f"[TGS] SGT→{IDc} for {IDv} TS4={TS4} life={Lifetime4}m")
     except Exception as e:
-        try:
-            send_json(conn, {"type": "ERR", "reason": str(e)})
-        except:
-            pass
+        send_json(conn, {"type": "ERR", "reason": str(e)})
     finally:
         conn.close()
 
 
+# --- Main ---
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default="auth_db.json")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--as-port", type=int, default=6000)
     ap.add_argument("--tgs-port", type=int, default=6001)
-    ap.add_argument("--initial-wall-clock", type=int, required=False,
-                    help="Shared initial epoch (UNIX seconds). Will read from epoch.txt.")
+    ap.add_argument(
+        "--initial-wall-clock",
+        type=int,
+        required=False,
+        help="Shared initial epoch (UNIX seconds). Will read from epoch.txt.",
+    )
     args = ap.parse_args()
 
-    # if not passed in command, read from epoch.txt
     if args.initial_wall_clock is None:
         try:
             with open("epoch.txt", "r") as f:
                 args.initial_wall_clock = int(f.read().strip())
-            print(
-                f"[INFO] Loaded initial wall clock from epoch.txt: {args.initial_wall_clock}")
+            log(f"[INFO] Loaded initial wall clock from epoch.txt: {args.initial_wall_clock}")
         except FileNotFoundError:
-            raise FileNotFoundError(
-                "epoch.txt not found. Please run time_synchronize.py first")
+            raise FileNotFoundError("epoch.txt not found. Please run time_synchronize.py first")
         except ValueError:
             raise ValueError("Invalid value in epoch.txt")
 
-    db = AuthDB(args.db)
-    threading.Thread(target=run_as, args=(
-        db, args.host, args.as_port, args.initial_wall_clock), daemon=True).start()
-    run_tgs(db, args.host, args.tgs_port, args.initial_wall_clock)
+    threading.Thread(target=run_as, args=(args.host, args.as_port, args.initial_wall_clock), daemon=True).start()
+    run_tgs(args.host, args.tgs_port, args.initial_wall_clock)
 
 
 if __name__ == "__main__":
