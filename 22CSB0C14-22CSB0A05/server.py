@@ -13,7 +13,7 @@ def handle_client(conn: socket.socket, addr, server_name: str, server_pass: str,
             send_json(conn, {"type": "ERR", "reason": "bad type"})
             return
 
-        # Expect fields from client.py
+        
         Ticketv = req["Ticketv"]
         Authenticatorc = req["Authenticatorc"]
         enc_msg = req["Message"]

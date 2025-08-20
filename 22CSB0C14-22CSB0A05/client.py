@@ -10,12 +10,14 @@ load_dotenv()
 
 CLIENT_NAME = os.getenv("CLIENT_NAME")
 CLIENT_PASSWORD = os.getenv("CLIENT_PASSWORD")
+AS_HOST = os.getenv("AS_HOST", "127.0.0.1")
+AS_PORT = os.getenv("AS_PORT", 6000)
 TGS_HOST = os.getenv("TGS_HOST", "127.0.0.1")
 TGS_PORT = int(os.getenv("TGS_PORT", 6001))
 TGS_ID = os.getenv("TGS_ID", "tgs1")
-CLIENT_AD = os.getenv("CLIENT_AD", "127.0.0.1")  # Optional, usually client IP
+CLIENT_AD = os.getenv("CLIENT_AD", "127.0.0.1")
 
-# --- Cache for TGTs / Service Tickets ---
+# --- Cache for TGTs / Service Tickets(SGTs) ---
 cache = Cache("./kerberos_cache")
 
 # --- AS request ---
@@ -97,6 +99,12 @@ def app_req(server_host, server_port, Ticketv, Kc_v, client_name, adc, message, 
         raise RuntimeError(f"APP error: {rep}")
 
     data = decrypt_obj(rep["data"], Kc_v)
+
+    # --- Mutual authentication check ---
+    expected_ts = TS5 + 1
+    if data.get("TS5+1") != expected_ts:
+        raise RuntimeError("Mutual authentication failed: server did not return correct TS5+1")
+
     return data
 
 # --- Main ---
@@ -104,8 +112,8 @@ def app_req(server_host, server_port, Ticketv, Kc_v, client_name, adc, message, 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--as-host", default="127.0.0.1")
-    ap.add_argument("--as-port", type=int, default=6000)
+    ap.add_argument("--as-host", default=AS_HOST)
+    ap.add_argument("--as-port", type=int, default=AS_PORT)
     ap.add_argument("--tgs-host", default=TGS_HOST)
     ap.add_argument("--tgs-port", type=int, default=TGS_PORT)
     ap.add_argument("--service", required=True,
@@ -134,24 +142,18 @@ def main():
     log(f"[Client:{CLIENT_NAME}] Got TGT (life={tgt_life}m)")
 
     # 2) TGS exchange
-    server_host = "127.0.0.1"  # for testing, can be configured
+    server_host = "127.0.0.1"
     k_c_s, ticket_s, lifetime4, ts4 = tgs_req(
         args.tgs_host, args.tgs_port, args.service, tgt, k_c_tgs, CLIENT_NAME, CLIENT_AD, args.initial_wall_clock
     )
     log(f"[Client:{CLIENT_NAME}] Got ServiceTicket for {args.service}, lifetime: {lifetime4}")
 
     # 3) App request
-    # Replace with actual service port mapping or config
-    SERVICE_PORT = int(os.getenv(f"{args.service.upper()}_PORT", 7000))
+    SERVICE_PORT = int(os.getenv(f"{args.service.upper()}_PORT", 7001))
     # print(f"{CLIENT_NAME}")
     rep = app_req(server_host, SERVICE_PORT, ticket_s, k_c_s,
                   CLIENT_NAME, CLIENT_AD, args.message, args.initial_wall_clock)
     log(f"[Client:{CLIENT_NAME}] Server reply: {rep['ack']}")
-
-    # 4) Reuse ticket within lifetime
-    log(f"[Client:{CLIENT_NAME}] Reusing ServiceTicket within lifetime...")
-    # rep2 = app_req(server_host, SERVICE_PORT, ticket_s, k_c_s, CLIENT_NAME, CLIENT_AD, args.message + " (second call)", args.initial_wall_clock)
-    # log(f"[Client:{CLIENT_NAME}] Second reply: {rep2['ack']}")
 
 
 if __name__ == "__main__":
