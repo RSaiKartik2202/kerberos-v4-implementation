@@ -1,75 +1,131 @@
+# Kerberos Authentication System — Socket Simulation with MongoDB
 
-# Kerberos Authentication System — Socket Simulation
+This is a minimal end‑to‑end simulation of the **Kerberos v4 flow** using Python sockets and MongoDB as the authentication database.
 
-This is a minimal end‑to‑end simulation of the Kerberos v4 flow using Python sockets.
 It includes:
-- **KDC** with **AS** (port `6000`) and **TGS** (port `6001`)
-- **Two services/servers**: `filesvc` (port `7000`) and `chatsvc` (port `7001`)
-- **Two clients**: `alice` and `bob`
-- A shared **Auth DB** storing `<clientName, passwd>` and `<serverName:port, passwd>`
 
-> Encryption here is a deliberately simple XOR keystream for teaching purposes,
-> derived from SHA‑256; it’s **not secure**. Use it only for learning/demonstration.
+- **KDC** with:
+  - **AS** (port `6000`) and
+  - **TGS** (port `6001`)
+- **Two services/servers**:
+  - `ftpServer` (port `7002`)
+  - `mailServer` (port `7001`)
+- **Two clients**: `Sai_Kartik` and `Karthikeya_Mittapalli`
+- A shared **MongoDB Auth DB** storing:
+  - `<clientName, password>`
+  - `<serverName:port, password>`  
+
+> Encryption here is a simplified DES-like scheme (for teaching purposes). **Not secure for production**.
+
+---
 
 ## Time & lifetime model
-All processes accept `--initial-wall-clock`, a UNIX epoch **shared by all** (e.g., `int(time.time())` when you start the demo).
-The current **Kerberos timestamp** is computed as minutes since that epoch. Lifetimes:
-- **TGT**: 10 minutes (default)
-- **Service Ticket**: 5 minutes (default)
+
+- All processes accept `--initial-wall-clock`, a UNIX epoch **shared by all** (e.g., `int(time.time())`).
+- The **Kerberos timestamp** is measured in **minutes since that epoch**.
+- Lifetimes:
+  - **TGT**: 10 minutes (default)
+  - **Service Ticket**: 5 minutes (default)
+
+---
 
 ## Files
-- `common.py` — helpers for toy crypto, JSON framing, and time
-- `kdc.py` — runs **AS** on `6000` and **TGS** on `6001`
-- `server.py` — run any service listed in `auth_db.json`
-- `client.py` — performs AS, TGS, and application requests
-- `auth_db.json` — authentication database
-- `run_demo.sh` / `run_demo.bat` — quickstart scripts (optional)
 
-## Quickstart (4 terminals)
-All commands run in this folder. Use the **same** `EPOCH=$(python -c "import time; print(int(time.time()))")` for all.
+- `utils/crypto.py` — DES-like encryption/decryption, JSON framing, and logging  
+- `utils/kerberos_db.py` — MongoDB helper functions to add/get clients, servers, TGS
+- `setup_db.py` — Script to initialize MongoDB with clients, servers, and TGS entries
+- `time_synchronize.py` — writes a common UNIX epoch (`epoch.txt`) used for synchronized Kerberos timestamps.
+- `kdc.py` — main KDC process, runs **AS** (port 6000) and **TGS** (port 6001)  
+- `server.py` — run any service stored in MongoDB  (e.g., ftpServer, mailServer)
+- `client.py` — performs AS, TGS, and application requests  with caching
+- `.env` — client/server credentials and port mapping  
+- `epoch.txt` — synchronized initial wall-clock  
+- `kerberos_cache/` — Diskcache used by clients to store TGT/Service Tickets
 
-### 1) Start KDC (AS+TGS)
-```bash
-python kdc.py --initial-wall-clock $EPOCH
-```
+---
 
-### 2) Start Server 1 (filesvc)
-```bash
-python server.py --name filesvc --initial-wall-clock $EPOCH
-```
+### System Setup (4 terminals)
 
-### 3) Start Server 2 (chatsvc)
-```bash
-python server.py --name chatsvc --initial-wall-clock $EPOCH
-```
+Run all commands in this folder.
 
-### 4) Run two clients
-```bash
-python client.py --client alice --service filesvc --message "hi file" --initial-wall-clock $EPOCH
-python client.py --client bob   --service chatsvc --message "yo chat" --initial-wall-clock $EPOCH
-```
+### 1) Synchronize initial wall-clock
+python time_synchronize.py
 
-You should see:
-- AS issues TGTs to clients
-- TGS issues service tickets
-- Servers validate tickets, decrypt messages, and send encrypted ACKs
-- Each client **reuses** the service ticket once within lifetime
+### 2) Initialize MongoDB authentication database
+python setup_db.py
 
-## Demonstrating expiry
-Wait >5 minutes (service ticket lifetime), then run the client **again** without re‑getting a new ticket (modify client to skip TGS) to observe an **expired** ticket error. Or simply re-run `client.py` after >10 minutes to see TGT changes.
 
-## Extending / Testing Notes
-- Add more clients/servers by editing `auth_db.json`.
-- Change lifetimes by adjusting `default_lifetime_tgt` / `default_lifetime_st` in `auth_db.json`.
-- All messages are framed JSON (`len|json`) over TCP sockets.
-- The **authenticator** includes `{client, ts}` encrypted with the corresponding session key.
-- The **ticket** contains `{client, session_key, ts, lifetime}` encrypted with the service’s secret.
+### 3) Start KDC (AS + TGS)
+python kdc.py
 
-## Mapping to Kerberos 4 (conceptual)
-- `AS_REQ/AS_REP` ↔ Client ↔ AS for TGT
-- `TGS_REQ/TGS_REP` ↔ Client ↔ TGS for Service Ticket
-- `APP_REQ/APP_REP` ↔ Client ↔ Service using Service Ticket
-- Timestamps measured in minutes since a shared start time; lifetimes enforced at TGS/Service.
+### 4) Start Servers
+python server.py --server ftpServer
+python server.py --server mailServer
 
-## Security disclaimer
-This is an **educational** emulation. Real Kerberos uses strong crypto (e.g., AES), secure replay caches, clock skew handling, and more rigorous validation.
+### 5) Run Clients
+python client.py --service ftpServer --message "Hello file"
+python client.py --service mailServer --message "Hey mail"
+
+
+---
+
+---
+
+## Expected Behavior
+
+- AS issues **Ticket-Granting Tickets (TGTs)** to clients.  
+- TGS issues **Service Tickets (SGTs)** to clients for requested services.  
+- Servers validate tickets, decrypt messages, and send **encrypted ACKs** (mutual auth via `TS5+1`).  
+- The **client proactively checks ticket lifetimes** and **only contacts TGS/servers when needed**.
+
+---
+
+## Demonstrating Expiry (Client-Enforced)
+
+- **Service Ticket lifetime (default 5 minutes):**  
+  - If the client requests the same service **within 5 minutes**, it **reuses the cached SGT**.  
+  - If the client requests **after 5 minutes**, the client detects SGT expiry **locally** and **obtains a fresh SGT from the TGS** (using the current TGT if still valid).
+
+- **TGT lifetime (default 10 minutes):**  
+  - If the client needs any service **after 10 minutes**, it detects TGT expiry and **first obtains a new TGT from the AS**, then requests a new SGT from the TGS.
+
+> Note: Servers still verify lifetime for defense-in-depth, but the **client already avoids sending expired tickets** by checking its cache timestamps before making requests.
+
+---
+
+## Client-Side Caching (with Local Lifetime Checks)
+
+- The client caches:
+  - **TGT** after the AS exchange (`TS2`, `Lifetime2` stored alongside `Kc_tgs` and `Tickettgs`).  
+  - **SGTs** per service after the TGS exchange (`TS4`, `Lifetime4` stored with `Kc_v` and `Ticketv`).  
+
+- Before contacting TGS or a service:
+  - The client **computes current Kerberos minutes** (since `epoch.txt`) and **compares** with cached `TS2 + Lifetime2` or `TS4 + Lifetime4`.  
+  - If **still valid**, it **reuses** the cached ticket; if **expired**, it **refreshes** (TGT from AS, SGT from TGS).
+
+- Mutual authentication: after `APP_REP`, the client **verifies** the server returned **`TS5+1`** (encrypted with `Kc_v`) to confirm the server also knows the session key.
+
+---
+
+## Protocol Flow (Mapping to Kerberos v4)
+
+- **AS_REQ / AS_REP** → Client ↔ Authentication Server (obtain **TGT**, `Kc_tgs`).  
+- **TGS_REQ / TGS_REP** → Client ↔ Ticket-Granting Server (obtain **SGT**, `Kc_v`).  
+- **APP_REQ / APP_REP** → Client ↔ Application Server (present **Ticketv** + **Authenticatorc**; receive encrypted ACK with `TS5+1`).  
+
+**Message Components**:
+- **Ticketv (to service)**: `{IDc, Kc_v, ADc, IDv, TS4, Lifetime4}` encrypted with **server key** `Kv`.  
+- **Tickettgs (to TGS)**: `{IDc, Kc_tgs, ADc, IDtgs, TS2, Lifetime2}` encrypted with **TGS key** `Ktgs`.  
+- **Authenticator**: `{IDc, ADc, TS}` encrypted with the corresponding session key (`Kc_tgs` or `Kc_v`).  
+- **Application Message/ACK**: encrypted with `Kc_v`.
+
+---
+
+## Security Disclaimer
+
+This project is for **educational purposes only**:
+- Uses simplified DES-like/stream-style toy crypto.  
+- No replay cache, no clock skew tolerance, not production-grade.  
+- **Do not use in real deployments.**
+
+---
